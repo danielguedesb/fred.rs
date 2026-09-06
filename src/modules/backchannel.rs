@@ -13,29 +13,22 @@ use std::{
   ops::{Deref, DerefMut},
 };
 
-/// Check if an existing connection can be used to the provided `server`, otherwise create a new one.
-///
-/// Returns whether a new connection was created.
-async fn check_and_create_transport(
-  backchannel: &Backchannel,
+/// Take the transport before any non-cancel-safe IO.
+async fn take_or_create_transport(
+  cached: &mut Option<ExclusiveConnection>,
   inner: &RefCount<ClientInner>,
   server: &Server,
-) -> Result<bool, Error> {
-  let mut transport = backchannel.transport.write().await;
-
-  if let Some(ref mut transport) = transport.deref_mut() {
+) -> Result<ExclusiveConnection, Error> {
+  if let Some(mut transport) = cached.take() {
     if &transport.server == server && transport.ping(inner).await.is_ok() {
       _debug!(inner, "Using existing backchannel connection to {}", server);
-      return Ok(false);
+      return Ok(transport);
     }
   }
-  *transport.deref_mut() = None;
 
-  let mut _transport = connection::create(inner, server, None).await?;
-  _transport.setup(inner, None).await?;
-  *transport.deref_mut() = Some(_transport);
-
-  Ok(true)
+  let mut transport = connection::create(inner, server, None).await?;
+  transport.setup(inner, None).await?;
+  Ok(transport)
 }
 
 /// A struct wrapping a separate connection to the server or cluster for client or cluster management commands.
@@ -107,7 +100,7 @@ impl Backchannel {
 
   /// Remove the provided server from the connection ID map.
   pub fn remove_connection_id(&self, server: &Server) {
-    self.connection_ids.lock().get(server);
+    self.connection_ids.lock().remove(server);
   }
 
   /// Read the connection ID for the provided server.
@@ -191,28 +184,26 @@ impl Backchannel {
     server: &Server,
     command: Command,
   ) -> Result<Resp3Frame, Error> {
-    let _ = check_and_create_transport(self, inner, server).await?;
+    // keep server selection and the exchange under one lock: another request must not replace the selected server between these two operations.
+    let mut cached = self.transport.write().await;
+    let mut transport = take_or_create_transport(&mut cached, inner, server).await?;
+    _debug!(
+      inner,
+      "Sending {} ({}) on backchannel to {}",
+      command.kind.to_str_debug(),
+      command.debug_id(),
+      server
+    );
 
-    if let Some(ref mut transport) = self.transport.write().await.deref_mut() {
-      _debug!(
-        inner,
-        "Sending {} ({}) on backchannel to {}",
-        command.kind.to_str_debug(),
-        command.debug_id(),
-        server
-      );
-
-      utils::timeout(
-        transport.request_response(command, inner.is_resp3()),
-        inner.connection_timeout(),
-      )
-      .await
-    } else {
-      Err(Error::new(
-        ErrorKind::Unknown,
-        "Failed to create backchannel connection.",
-      ))
+    let result = utils::timeout(
+      transport.request_response(command, inner.is_resp3()),
+      inner.connection_timeout(),
+    )
+    .await;
+    if result.is_ok() {
+      *cached = Some(transport);
     }
+    result
   }
 
   /// Find the server identifier that should receive the provided command.

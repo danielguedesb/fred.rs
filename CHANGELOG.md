@@ -1,3 +1,9 @@
+## Unreleased
+
+* Follow ASK on the importing connection, including importers with no owned slots, without changing the slot map or consuming another command's reply.
+* Bound ASK preparation and isolate failures to the affected connection. Unresolved commands on that connection fail to their callers. Completed pipeline commands are not replayed.
+* Retain redirected blocking-read interruption and discard interrupted backchannel exchanges before reusing a connection.
+
 ## 10.1.0
 
 * Add `DynamicPool` interface

@@ -255,33 +255,19 @@ async fn process_ask(
   slot: u16,
   mut command: Command,
 ) -> Result<(), Error> {
+  if client_utils::read_bool_atomic(&command.timed_out) {
+    return Ok(());
+  }
   command.use_replica = false;
   command.hasher = ClusterHash::Custom(slot);
+  command.cluster_node = None;
 
-  if let Err(e) = command.decr_check_redirections() {
+  if let Err(e) = command.decr_check_redirections().and_then(|_| command.decr_check_attempted()) {
     command.respond_to_caller(Err(e));
     return Ok(());
   }
-  let attempts_remaining = command.attempts_remaining;
-  let asking_result = Box::pin(utils::send_asking_with_policy(
-    inner,
-    router,
-    &server,
-    slot,
-    attempts_remaining,
-  ))
-  .await;
-  if let Err(e) = asking_result {
-    command.respond_to_caller(Err(e.clone()));
-    return Err(e);
-  }
-
-  if let Err(error) = write_command_t!(inner, router, command) {
-    _debug!(inner, "Error sending command after ASKING: {:?}", error);
-    Err(error)
-  } else {
-    Ok(())
-  }
+  Box::pin(utils::write_asking_command(inner, router, &server, slot, command)).await;
+  Ok(())
 }
 
 /// Sync the cluster state then retry the command.
@@ -294,6 +280,7 @@ async fn process_moved(
 ) -> Result<(), Error> {
   command.use_replica = false;
   command.hasher = ClusterHash::Custom(slot);
+  command.cluster_node = None;
 
   utils::delay_cluster_sync(inner, router).await?;
   _debug!(inner, "Syncing cluster after MOVED {} {}", slot, server);

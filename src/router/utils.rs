@@ -10,7 +10,7 @@ use crate::{
   },
   router::{centralized, clustered, responses, Counters, ReconnectServer, Router},
   runtime::RefCount,
-  types::*,
+  types::{config::Blocking, *},
   utils as client_utils,
 };
 use bytes::Bytes;
@@ -437,59 +437,97 @@ pub async fn add_replica_with_policy(
   Ok(())
 }
 
-/// Send `ASKING` to the provided server, reconnecting as needed.
-pub async fn send_asking_with_policy(
+/// Follow one ASK without bypassing pending replies or changing the slot map.
+///
+/// Only this redirection path drains a connection. 
+/// The router owns it until ASKING and the redirected command have both been written.
+pub async fn write_asking_command(
   inner: &RefCount<ClientInner>,
   router: &mut Router,
   server: &Server,
   slot: u16,
-  mut attempts_remaining: u32,
-) -> Result<(), Error> {
-  macro_rules! next_sleep {
-    ($err:expr) => {{
-      let delay = match next_reconnection_delay(inner) {
-        Ok(delay) => delay,
-        Err(_) => {
-          return Err(
-            $err.unwrap_or_else(|| Error::new(ErrorKind::Routing, "Unable to route command or reconnect.")),
-          );
+  command: Command,
+) {
+  let timeout = [
+    command.timeout_dur,
+    Some(inner.internal_command_timeout()),
+    inner.connection.unresponsive.max_timeout,
+  ]
+  .into_iter()
+  .flatten()
+  .filter(|duration| !duration.is_zero())
+  .min()
+  .unwrap_or(Duration::from_secs(10));
+
+  let mut pending = Some(command);
+  let result = client_utils::timeout(
+    async {
+      if router.connections.get_connection_mut(server).is_none() {
+        router.connections.add_connection(inner, server).await?;
+        inner.backchannel.update_connection_ids(&router.connections);
+      }
+      let conn = router
+        .connections
+        .get_connection_mut(server)
+        .ok_or_else(|| Error::new(ErrorKind::Routing, "Missing ASK target connection."))?;
+
+      conn.flush().await?;
+      conn.drain(inner).await?;
+      if !conn.buffer.is_empty() {
+        return Err(Error::new(ErrorKind::IO, "ASK target closed with pending replies."));
+      }
+      conn.last_write = None;
+      let command = pending.as_mut().expect("ASK command has not been queued");
+      if client_utils::read_bool_atomic(&command.timed_out) {
+        return Err(Error::new(ErrorKind::Timeout, "ASK command timed out."));
+      }
+      let (frame, _) = prepare_command(inner, &conn.counters, command)?;
+      let asking = protocol_utils::encode_frame(inner, &Command::new_asking(slot))?;
+      conn.write(asking, true, false).await?;
+      match conn.read_skip_pubsub(inner).await? {
+        Some(Resp3Frame::SimpleString { data, .. }) if data.as_ref() == b"OK" => {},
+        Some(frame) => {
+          protocol_utils::frame_to_results(frame)?;
+          return Err(Error::new(ErrorKind::Protocol, "Invalid ASKING response."));
         },
-      };
-      let _ = read_and_sleep(inner, router, delay).await;
-      continue;
-    }};
+        None => return Err(Error::new(ErrorKind::IO, "ASK target closed before ASKING response.")),
+      }
+      if client_utils::read_bool_atomic(&command.timed_out) {
+        return Err(Error::new(ErrorKind::Timeout, "ASK command timed out."));
+      }
+
+      let mut command = pending.take().expect("ASK command has not been queued");
+      let is_blocking = command.blocks_connection();
+      let check_unresponsive = !command.kind.is_pubsub() && inner.has_unresponsive_duration();
+      command.network_start = Some(Instant::now());
+      command.write_attempts += 1;
+      conn.push_command(command);
+      conn.write(frame, true, check_unresponsive).await?;
+      if is_blocking {
+        inner.backchannel.set_blocked(server);
+        if inner.counters.read_cmd_buffer_len() > 0 && inner.config.blocking == Blocking::Interrupt {
+          client_utils::interrupt_blocked_connection(inner, ClientUnblockFlag::Error).await?;
+        }
+      }
+      Ok::<_, Error>(())
+    },
+    timeout,
+  )
+  .await;
+
+  if let Err(error) = result {
+    if let Some(mut command) = pending {
+      command.respond_to_caller(Err(error.clone()));
+    }
+    if let Some(mut conn) = router.connections.take_connection(Some(server)) {
+      for mut command in conn.buffer.drain(..) {
+        command.respond_to_caller(Err(error.clone()));
+      }
+    }
+    inner.backchannel.remove_connection_id(server);
+    inner.backchannel.check_and_unblock(server);
+    responses::broadcast_reader_error(inner, server, Some(error));
   }
-
-  loop {
-    let mut command = Command::new_asking(slot);
-    command.cluster_node = Some(server.clone());
-    command.hasher = ClusterHash::Custom(slot);
-
-    if attempts_remaining == 0 {
-      return Err(Error::new(ErrorKind::Routing, "Max attempts reached."));
-    }
-    attempts_remaining -= 1;
-
-    let conn = match router.route(&command) {
-      Some(conn) => conn,
-      None => next_sleep!(None),
-    };
-    let frame = protocol_utils::encode_frame(inner, &command)?;
-    if let Err(err) = conn.write(frame, true, false).await {
-      next_sleep!(Some(err));
-    }
-    if let Err(err) = conn.flush().await {
-      next_sleep!(Some(err));
-    }
-    if let Err(err) = conn.read_skip_pubsub(inner).await {
-      next_sleep!(Some(err));
-    } else {
-      break;
-    }
-  }
-
-  inner.reset_reconnection_attempts();
-  Ok(())
 }
 
 #[cfg(feature = "replicas")]
