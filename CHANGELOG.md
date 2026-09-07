@@ -3,6 +3,7 @@
 * Follow ASK on the importing connection, including importers with no owned slots, without changing the slot map or consuming another command's reply.
 * Bound ASK preparation and isolate failures to the affected connection. Unresolved commands on that connection fail to their callers. Completed pipeline commands are not replayed.
 * Retain redirected blocking-read interruption and discard interrupted backchannel exchanges before reusing a connection.
+* Keep a healthy ASK target after a completed drain when the caller timed out before ASKING was written. Treat returned post-ASK interrupt errors as warnings, matching ordinary commands; interrupted IO still closes the socket.
 
 ## 10.1.0
 

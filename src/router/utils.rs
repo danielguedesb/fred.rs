@@ -439,7 +439,7 @@ pub async fn add_replica_with_policy(
 
 /// Follow one ASK without bypassing pending replies or changing the slot map.
 ///
-/// Only this redirection path drains a connection. 
+/// Only this redirection path drains a connection.
 /// The router owns it until ASKING and the redirected command have both been written.
 pub async fn write_asking_command(
   inner: &RefCount<ClientInner>,
@@ -477,10 +477,14 @@ pub async fn write_asking_command(
         return Err(Error::new(ErrorKind::IO, "ASK target closed with pending replies."));
       }
       conn.last_write = None;
-      let command = pending.as_mut().expect("ASK command has not been queued");
-      if client_utils::read_bool_atomic(&command.timed_out) {
-        return Err(Error::new(ErrorKind::Timeout, "ASK command timed out."));
+      if pending
+        .as_ref()
+        .is_some_and(|command| client_utils::read_bool_atomic(&command.timed_out))
+      {
+        drop(pending.take());
+        return Ok(());
       }
+      let command = pending.as_mut().expect("ASK command has not been queued");
       let (frame, _) = prepare_command(inner, &conn.counters, command)?;
       let asking = protocol_utils::encode_frame(inner, &Command::new_asking(slot))?;
       conn.write(asking, true, false).await?;
@@ -506,7 +510,9 @@ pub async fn write_asking_command(
       if is_blocking {
         inner.backchannel.set_blocked(server);
         if inner.counters.read_cmd_buffer_len() > 0 && inner.config.blocking == Blocking::Interrupt {
-          client_utils::interrupt_blocked_connection(inner, ClientUnblockFlag::Error).await?;
+          if let Err(error) = client_utils::interrupt_blocked_connection(inner, ClientUnblockFlag::Error).await {
+            _warn!(inner, "Failed to unblock connection: {:?}", error);
+          }
         }
       }
       Ok::<_, Error>(())
