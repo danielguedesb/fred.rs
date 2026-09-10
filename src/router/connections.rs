@@ -11,7 +11,7 @@ use crate::{
   runtime::RefCount,
   types::config::Server,
 };
-use futures::future::try_join_all;
+use futures::future::join_all;
 use semver::Version;
 use std::collections::{HashMap, VecDeque};
 
@@ -351,9 +351,19 @@ impl Connections {
       Connections::Clustered {
         connections: ref mut writers,
         ..
-      } => try_join_all(writers.values_mut().map(|writer| writer.flush()))
-        .await
-        .map(|_| ()),
+      } => {
+        let error = parking_lot::Mutex::new(None);
+        join_all(writers.values_mut().map(|writer| {
+          let error = &error;
+          async move {
+            if let Err(err) = writer.flush().await {
+              error.lock().get_or_insert(err);
+            }
+          }
+        }))
+        .await;
+        error.into_inner().map_or(Ok(()), Err)
+      },
     }
   }
 

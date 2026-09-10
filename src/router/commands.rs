@@ -262,7 +262,10 @@ async fn process_ask(
   command.hasher = ClusterHash::Custom(slot);
   command.cluster_node = None;
 
-  if let Err(e) = command.decr_check_redirections().and_then(|_| command.decr_check_attempted()) {
+  if let Err(e) = command
+    .decr_check_redirections()
+    .and_then(|_| command.decr_check_attempted())
+  {
     command.respond_to_caller(Err(e));
     return Ok(());
   }
@@ -409,7 +412,7 @@ async fn process_command(
   inner.counters.decr_cmd_buffer_len();
 
   _trace!(inner, "Recv command: {:?}", command);
-  match command {
+  let result = match command {
     RouterCommand::SyncCluster { tx } => process_sync_cluster(inner, router, tx).await,
     #[cfg(feature = "transactions")]
     RouterCommand::Transaction {
@@ -434,7 +437,14 @@ async fn process_command(
     } => process_replica_reconnect(inner, router, server, force, tx, replica).await,
     RouterCommand::Ask { server, slot, command } => process_ask(inner, router, server, slot, command).await,
     RouterCommand::Moved { command, server, slot } => process_moved(inner, router, server, slot, command).await,
+  };
+
+  if inner.counters.read_cmd_buffer_len() == 0 {
+    if let Err(err) = router.flush().await {
+      _debug!(inner, "Failed to flush connections: {:?}", err);
+    }
   }
+  result
 }
 
 /// Try to read frames from any socket, otherwise try to write the next command.
